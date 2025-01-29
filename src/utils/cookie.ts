@@ -1,8 +1,5 @@
-import axios from 'axios';
 import * as dotenv from 'dotenv';
-
 dotenv.config();
-
 
 const getHeaders = () => ({
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -25,17 +22,20 @@ const fetchCookie = async (domain: string) => {
   console.log(`Attempting to fetch cookie for domain: vinted.${domain}`);
   try {
     console.log('Making request to Vinted...');
-    const response = await axios.get(`https://www.vinted.${domain}`, {
-      headers: {
-        "user-agent": getHeaders()["User-Agent"],
-      },
-      timeout: 5000
+    const response = await fetch(`https://www.vinted.${domain}`, {
+      headers: getHeaders(),
+      signal: AbortSignal.timeout(5000)
     });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
 
     console.log('Got response from Vinted');
     
-    const cookies = response.headers["set-cookie"];
-    if (!cookies) {
+    const cookieHeader = response.headers.get('set-cookie');
+    const cookies = cookieHeader ? cookieHeader.split(',') : [];
+    if (cookies.length === 0) {
       console.error('No set-cookie header found in response');
       throw new Error("No cookies found");
     }
@@ -43,7 +43,7 @@ const fetchCookie = async (domain: string) => {
     console.log('Found set-cookie headers');
     
     // Find the cookie containing access_token_web
-    const accessTokenCookie = cookies.find(cookie => cookie.includes('access_token_web'));
+    const accessTokenCookie = cookies.find((cookie: string | string[]) => cookie.includes('access_token_web'));
     if (!accessTokenCookie) {
       console.error('No access_token_web cookie found');
       throw new Error("Access token cookie not found");
@@ -64,13 +64,8 @@ const fetchCookie = async (domain: string) => {
     };
   } catch (error) {
     console.error('Error fetching cookie:', error);
-    if (axios.isAxiosError(error)) {
-      console.error('Axios error details:', {
-        status: error.response?.status,
-        statusText: error.response?.statusText,
-        headers: error.response?.headers,
-        data: error.response?.data
-      });
+    if (error instanceof Error) {
+      console.error('Error details:', error.message);
     }
     throw error;
   }
@@ -78,21 +73,23 @@ const fetchCookie = async (domain: string) => {
 
 const fetchItemDetails = async (itemId: string, domain: string, accessToken: string) => {
   try {
-    const response = await axios.get(
+    const response = await fetch(
       `https://www.vinted.${domain}/api/v2/items/${itemId}`,
       {
         headers: {
-          'User-Agent': getHeaders()['User-Agent'],
-          'Accept': getHeaders()['Accept'],
-          'Accept-Language': getHeaders()['Accept-Language'],
+          ...getHeaders(),
           'Accept-Encoding': 'gzip, deflate, br',
           'Referer': `https://www.vinted.${domain}/`,
-          cookie: `access_token_web=${accessToken}`,
-        },
-        proxy: false
+          cookie: `access_token_web=${accessToken}`
+        }
       }
     );
-    return response.data;
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    return await response.json();
   } catch (error) {
     console.error('Error fetching item details:', error);
     throw error;

@@ -1,5 +1,4 @@
 import { fetchCookie, extractItemId, fetchItemDetails } from './utils/cookie';
-import axios from 'axios';
 import * as fs from 'fs';
 import dotenv from 'dotenv';
 dotenv.config();
@@ -65,24 +64,31 @@ async function analyzeImages(images: string[], prompt: string): Promise<string> 
     console.log('Sending request to API...');
     console.log('Request payload:', JSON.stringify(requestData, null, 2));
 
-    const response = await axios.post<ApiResponse>(API_URL, requestData, {
+    const response = await fetch(API_URL, {
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${API_KEY}`,
         'Content-Type': 'application/json'
       },
-      timeout: 100000    });
+      body: JSON.stringify(requestData),
+      signal: AbortSignal.timeout(1000000)
+    });
+
+    if (!response.ok) {
+      throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+    }
 
     console.log('Response received successfully');
     
+    const responseData = await response.json() as ApiResponse;
     // Log the full response to a file for debugging
-    fs.writeFileSync('api_response.json', JSON.stringify(response.data as ApiResponse, null, 2));
+    fs.writeFileSync('api_response.json', JSON.stringify(responseData, null, 2));
 
-    return response.data.choices[0].message.content;
+    return responseData.choices[0].message.content;
   } catch (error) {
     console.error('Error making API request:', error);
-    if (axios.isAxiosError(error)) {
-      console.error('Response data:', error.response?.data);
-      console.error('Status code:', error.response?.status);
+    if (error instanceof Error) {
+      console.error('Error details:', error.message);
     }
     throw error;
   }
