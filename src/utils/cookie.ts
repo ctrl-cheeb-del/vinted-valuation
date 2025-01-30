@@ -1,99 +1,256 @@
-import * as dotenv from 'dotenv';
-dotenv.config();
+import { ProxyManager } from './proxy';
+import * as fs from 'fs';
 
-const getHeaders = () => ({
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'en-GB,en;q=0.9',
-});
+interface Cookie {
+  accessToken: string;
+  expiration: number;
+  created: number;
+}
 
-const extractAccessToken = (cookieString: string): string | null => {
-  const match = cookieString.match(/access_token_web=([^;]+)/);
-  return match ? match[1] : null;
-};
+interface CookieStore {
+  [domain: string]: Cookie[];
+}
 
-const extractItemId = (url: string): string => {
-  const match = url.match(/\/items\/(\d+)/);
-  if (!match) throw new Error("Could not extract item ID from URL");
-  return match[1];
-};
+const COOKIE_FILE = 'cookies.json';
+const MAX_COOKIES = 20;
+const MIN_COOKIES = 3;
+const COOKIE_LIFETIME = 10 * 60 * 1000; // 10 minutes
+const FETCH_DELAY = 500;
 
-const fetchCookie = async (domain: string) => {
-  console.log(`Attempting to fetch cookie for domain: vinted.${domain}`);
+let globalCookies: CookieStore = {};
+let isBackgroundFetching = false;
+
+const loadStoredCookies = (): CookieStore => {
   try {
-    console.log('Making request to Vinted...');
-    const response = await fetch(`https://www.vinted.${domain}`, {
-      headers: getHeaders(),
-      signal: AbortSignal.timeout(5000)
+    if (fs.existsSync(COOKIE_FILE)) {
+      console.log(`[VINTED COOKIE] Found local ${COOKIE_FILE}`);
+      const data = fs.readFileSync(COOKIE_FILE, 'utf-8');
+      const cookies = JSON.parse(data) as CookieStore;
+      
+      // Log the number of cookies found for each domain
+      Object.entries(cookies).forEach(([domain, domainCookies]) => {
+        console.log(`[VINTED COOKIE] Found ${(domainCookies as Cookie[]).length} stored cookies for ${domain}`);
+      });
+      
+      return cookies;
+    } else {
+      console.log(`[VINTED COOKIE] No ${COOKIE_FILE} found in local directory`);
+    }
+  } catch (error) {
+    console.error(`[VINTED COOKIE] Error reading ${COOKIE_FILE}:`, error);
+    try {
+      console.log(`[VINTED COOKIE] Attempting to delete corrupted ${COOKIE_FILE}`);
+      fs.unlinkSync(COOKIE_FILE);
+    } catch (e) {
+      console.error(`[VINTED COOKIE] Error deleting corrupted ${COOKIE_FILE}:`, e);
+    }
+  }
+  return {};
+};
+
+const saveCookies = (cookies: CookieStore): void => {
+  try {
+    globalCookies = cookies;
+    fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookies, null, 2));
+    console.log(`[VINTED COOKIE] Successfully saved cookies to ${COOKIE_FILE}`);
+    
+    // Log summary of saved cookies
+    Object.entries(cookies).forEach(([domain, domainCookies]) => {
+      console.log(`[VINTED COOKIE] Saved ${domainCookies.length} cookies for ${domain}`);
+    });
+  } catch (error) {
+    console.error(`[VINTED COOKIE] Error saving cookies to ${COOKIE_FILE}:`, error);
+  }
+};
+
+const fetchSingleCookie = async (domain: string): Promise<Cookie | null> => {
+  try {
+    console.log(`[VINTED COOKIE] Attempting to fetch single cookie for domain: ${domain}`);
+    const response = await ProxyManager.makeRequest(`https://www.vinted.${domain}`, {
+      method: 'GET'
     });
 
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+    const cookies = response.headers['set-cookie'];
+    if (!cookies) {
+      console.log('[VINTED COOKIE] No cookies found in response headers');
+      throw new Error('No cookies found');
     }
 
-    console.log('Got response from Vinted');
-    
-    const cookieHeader = response.headers.get('set-cookie');
-    const cookies = cookieHeader ? cookieHeader.split(',') : [];
-    if (cookies.length === 0) {
-      console.error('No set-cookie header found in response');
-      throw new Error("No cookies found");
-    }
-
-    console.log('Found set-cookie headers');
-    
-    // Find the cookie containing access_token_web
-    const accessTokenCookie = cookies.find((cookie: string | string[]) => cookie.includes('access_token_web'));
+    const accessTokenCookie = cookies.find((c: string) => c.includes('access_token_web'));
     if (!accessTokenCookie) {
-      console.error('No access_token_web cookie found');
-      throw new Error("Access token cookie not found");
+      console.log('[VINTED COOKIE] Access token cookie not found in response');
+      throw new Error('Access token cookie not found');
     }
 
-    const accessToken = extractAccessToken(accessTokenCookie);
-    if (!accessToken) {
-      console.error('Could not extract access token from cookie');
-      throw new Error("Could not extract access token");
+    const match = accessTokenCookie.match(/access_token_web=([^;]+)/);
+    if (!match) {
+      console.log('[VINTED COOKIE] Could not extract access token from cookie');
+      throw new Error('Could not extract access token');
     }
 
-    console.log('Successfully extracted access token');
-
+    console.log('[VINTED COOKIE] Successfully fetched new cookie');
     return {
-      accessToken,
-      expiration: Date.now() + 1000 * 60 * 60 * 24, 
+      accessToken: match[1],
+      expiration: Date.now() + COOKIE_LIFETIME,
       created: Date.now()
     };
   } catch (error) {
-    console.error('Error fetching cookie:', error);
-    if (error instanceof Error) {
-      console.error('Error details:', error.message);
-    }
-    throw error;
+    console.error('[VINTED COOKIE] Failed to fetch cookie:', error);
+    return null;
   }
 };
 
-const fetchItemDetails = async (itemId: string, domain: string, accessToken: string) => {
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const fetchConcurrentCookies = async (domain: string, count: number): Promise<void> => {
+  if (isBackgroundFetching) {
+    console.log('[VINTED COOKIE] Background fetch already in progress, skipping...');
+    return;
+  }
+  isBackgroundFetching = true;
+
+  console.log(`[VINTED COOKIE] Starting concurrent fetch for ${count} cookies on domain ${domain}`);
+  console.log(`[VINTED COOKIE] Current cookie count: ${globalCookies[domain]?.length || 0}/${MAX_COOKIES}`);
+  let successCount = 0;
+  let failureCount = 0;
+
   try {
-    const response = await fetch(
-      `https://www.vinted.${domain}/api/v2/items/${itemId}`,
-      {
-        headers: {
-          ...getHeaders(),
-          'Accept-Encoding': 'gzip, deflate, br',
-          'Referer': `https://www.vinted.${domain}/`,
-          cookie: `access_token_web=${accessToken}`
+    for (let i = 0; i < count; i++) {
+      try {
+        const delayTime = FETCH_DELAY + Math.random() * 1000;
+        console.log(`[VINTED COOKIE] Waiting ${delayTime.toFixed(0)}ms before fetching cookie ${i + 1}/${count}`);
+        await delay(delayTime);
+        
+        const cookie = await fetchSingleCookie(domain);
+        
+        if (cookie) {
+          if (!globalCookies[domain]) globalCookies[domain] = [];
+          
+          if (!globalCookies[domain].some(c => c.accessToken === cookie.accessToken)) {
+            globalCookies[domain].push(cookie);
+            successCount++;
+            
+            globalCookies[domain].sort((a, b) => b.created - a.created);
+            
+            if (globalCookies[domain].length > MAX_COOKIES) {
+              const removed = globalCookies[domain].length - MAX_COOKIES;
+              globalCookies[domain] = globalCookies[domain].slice(0, MAX_COOKIES);
+              console.log(`[VINTED COOKIE] Removed ${removed} old cookies to maintain max limit`);
+            }
+            
+            console.log(`[VINTED COOKIE] Successfully added new cookie (${successCount}/${count})`);
+            
+            if (successCount % 5 === 0) {
+              saveCookies(globalCookies);
+              console.log(`[VINTED COOKIE] Progress update: ${successCount} successful, ${failureCount} failed`);
+            }
+          } else {
+            console.log('[VINTED COOKIE] Duplicate cookie found, skipping');
+          }
+        } else {
+          failureCount++;
+          console.log(`[VINTED COOKIE] Failed to fetch cookie ${i + 1}/${count}`);
         }
+      } catch (error) {
+        failureCount++;
+        console.error('[VINTED COOKIE] Error in fetch iteration:', error);
+        continue;
       }
-    );
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
     }
-
-    return await response.json();
-  } catch (error) {
-    console.error('Error fetching item details:', error);
-    throw error;
+    
+    saveCookies(globalCookies);
+    console.log(`[VINTED COOKIE] Fetch complete. Results:`);
+    console.log(`- Successful fetches: ${successCount}`);
+    console.log(`- Failed fetches: ${failureCount}`);
+    console.log(`- Total valid cookies: ${globalCookies[domain]?.length || 0}`);
+    console.log(`- Cookie expiration times:`);
+    globalCookies[domain]?.forEach((cookie, index) => {
+      const timeLeft = Math.round((cookie.expiration - Date.now()) / 1000);
+      // console.log(`  ${index + 1}. Expires in ${timeLeft}s`);
+    });
+  } finally {
+    isBackgroundFetching = false;
   }
 };
 
-export { fetchCookie, extractItemId, fetchItemDetails };
+export const fetchCookie = async (domain: string = 'co.uk', force: boolean = false): Promise<Cookie[]> => {
+  console.log(`[VINTED COOKIE] Fetching cookies for ${domain} (force: ${force})`);
+  
+  // Always try to load from file first
+  if (Object.keys(globalCookies).length === 0) {
+    console.log('[VINTED COOKIE] Loading cookies from storage');
+    globalCookies = loadStoredCookies();
+  }
+
+  if (!globalCookies[domain]) {
+    console.log('[VINTED COOKIE] No cookies found for domain, initializing empty array');
+    globalCookies[domain] = [];
+  }
+
+  // Clean expired cookies
+  const now = Date.now();
+  const beforeCount = globalCookies[domain].length;
+  globalCookies[domain] = globalCookies[domain].filter(cookie => {
+    const timeLeft = cookie.expiration - now;
+    const isValid = cookie && timeLeft > 0;
+    if (!isValid) {
+      console.log(`[VINTED COOKIE] Cookie expired (was valid for ${Math.round((now - cookie.created) / 1000)}s)`);
+    }
+    return isValid;
+  });
+  
+  const expiredCount = beforeCount - globalCookies[domain].length;
+  if (expiredCount > 0) {
+    console.log(`[VINTED COOKIE] Removed ${expiredCount} expired cookies`);
+    // Save the cleaned cookie list
+    saveCookies(globalCookies);
+  }
+
+  // Check if we have enough valid cookies
+  const validCookies = globalCookies[domain].length;
+  console.log(`[VINTED COOKIE] ${validCookies} valid cookies available`);
+
+  // Only fetch new cookies if we're below MIN_COOKIES or forced
+  if (force || validCookies < MIN_COOKIES) {
+    const cookiesNeeded = MAX_COOKIES - validCookies;
+    if (cookiesNeeded > 0) {
+      console.log(`[VINTED COOKIE] Need to fetch ${cookiesNeeded} new cookies (minimum required: ${MIN_COOKIES})`);
+      await fetchConcurrentCookies(domain, cookiesNeeded);
+    }
+  } else {
+    console.log(`[VINTED COOKIE] Using existing cookies (${validCookies}/${MAX_COOKIES} available)`);
+    console.log('[VINTED COOKIE] Cookie expiration times:');
+    globalCookies[domain].forEach((cookie, index) => {
+      const timeLeft = Math.round((cookie.expiration - now) / 1000);
+      // console.log(`  ${index + 1}. Expires in ${timeLeft}s`);
+    });
+  }
+
+  return globalCookies[domain];
+};
+
+export const invalidateCookie = async (domain: string, tokenToRemove: string): Promise<Cookie[]> => {
+  console.log(`[VINTED COOKIE] Invalidating cookie for domain ${domain}`);
+  
+  if (!globalCookies[domain]) {
+    console.log('[VINTED COOKIE] No cookies found for domain, initializing empty array');
+    globalCookies[domain] = [];
+  }
+
+  const beforeCount = globalCookies[domain].length;
+  globalCookies[domain] = globalCookies[domain].filter(cookie => 
+    cookie && cookie.accessToken && cookie.accessToken !== tokenToRemove
+  );
+  const removedCount = beforeCount - globalCookies[domain].length;
+  
+  console.log(`[VINTED COOKIE] Removed ${removedCount} invalid cookies`);
+  console.log(`[VINTED COOKIE] ${globalCookies[domain].length} cookies remaining`);
+
+  saveCookies(globalCookies);
+  return globalCookies[domain];
+};
+
+export const getRandomCookie = (cookieList: Cookie[]): Cookie | null => {
+  if (!cookieList || cookieList.length === 0) return null;
+  return cookieList[Math.floor(Math.random() * cookieList.length)];
+};

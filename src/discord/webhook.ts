@@ -1,4 +1,4 @@
-import { WebhookClient, EmbedBuilder, EmbedField } from 'discord.js';
+import { WebhookClient, EmbedBuilder } from 'discord.js';
 
 interface ItemData {
   title: string;
@@ -36,6 +36,7 @@ const COLORS = {
 export async function postToDiscordWebhook(
   data: ItemData
 ): Promise<void> {
+  // Create webhook client with no proxy
   const webhook = new WebhookClient({ url: DISCORD_WEBHOOK_URL });
 
   // Determine embed color based on ROI
@@ -59,7 +60,7 @@ export async function postToDiscordWebhook(
     `📦 **Condition**`,
     `• ${data.condition || 'N/A'}`,
     ``,
-    `💸 **Price:** £${data.price}`,
+    `💸 **Price:** £${data.listedPrice}`,
     ``,
     `💰 **Price Analysis**`,
     `• Estimated Value: ${data.estimatedValue || `£${data.price}`}`,

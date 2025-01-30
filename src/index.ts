@@ -1,19 +1,21 @@
 import { analyzeVintedItem, fetchVintedCatalog } from './imageAnalyzer';
 import { postToDiscordWebhook } from './discord/webhook';
 import { sleep } from './utils/helpers';
+import { ProxyManager } from './utils/proxy';
 
 const REDIRECT_PREFIX = 'https://andy-redirect-thing.alistair.cloud/';
 const SEARCH_TERMS = ['ralph lauren']; // Add more search terms as needed
 const DOMAIN = 'co.uk';
-const DELAY_BETWEEN_ITEMS = 5000; // 5 seconds delay between processing items
+const CONCURRENT_ITEMS = 5; // Process 4 items at a time
 const DELAY_BETWEEN_SEARCHES = 30000; // 30 seconds delay between search terms
+const ITEMS_PER_PAGE = 20; // Number of items to fetch per page
 
 // Keep track of processed items to avoid duplicates
 const processedItems = new Set<number>();
 
 async function processItem(item: any) {
   if (processedItems.has(item.id)) {
-    return;
+    return null;
   }
 
   try {
@@ -50,21 +52,38 @@ async function processItem(item: any) {
     await postToDiscordWebhook(discordData);
     processedItems.add(item.id);
     console.log(`Successfully processed item ${item.id}`);
+    return discordData;
   } catch (error) {
     console.error(`Failed to process item ${item.id}:`, error);
+    return null;
   }
 }
 
+async function processItemBatch(items: any[]) {
+  const itemPromises = items.map(item => processItem(item));
+  const results = await Promise.all(itemPromises);
+  return results.filter(result => result !== null);
+}
+
 async function monitorCatalog() {
+  // Initialize proxy settings before starting
+  ProxyManager.loadProxySettings();
+  console.log('Starting Vinted catalog monitor with parallel processing...');
+
   while (true) {
     for (const searchTerm of SEARCH_TERMS) {
       try {
         console.log(`Fetching catalog for search term: ${searchTerm}`);
-        const catalog = await fetchVintedCatalog(DOMAIN, searchTerm);
+        const catalog = await fetchVintedCatalog(DOMAIN, searchTerm, 1, ITEMS_PER_PAGE);
+        console.log('Catalog response:', JSON.stringify(catalog, null, 2));
         
-        for (const item of catalog.items) {
-          await processItem(item);
-          await sleep(DELAY_BETWEEN_ITEMS);
+        // Filter out already processed items
+        const newItems = catalog?.items?.filter(item => !processedItems.has(item.id)) || [];
+        
+        // Process items in batches of CONCURRENT_ITEMS
+        for (let i = 0; i < newItems.length; i += CONCURRENT_ITEMS) {
+          const batch = newItems.slice(i, i + CONCURRENT_ITEMS);
+          await processItemBatch(batch);
         }
         
       } catch (error) {
@@ -77,7 +96,6 @@ async function monitorCatalog() {
 }
 
 // Start the monitoring process
-console.log('Starting Vinted catalog monitor...');
 monitorCatalog().catch(error => {
   console.error('Fatal error in monitor:', error);
   process.exit(1);

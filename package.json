@@ -6,6 +6,8 @@
     "cookie": "^1.0.2",
     "discord.js": "^14.17.3",
     "dotenv": "^16.4.7",
+    "p-limit": "^6.2.0",
+    "socks-proxy-agent": "^8.0.5",
     "typescript": "^5.7.3",
     "zod": "^3.24.1",
     "zod-to-json-schema": "^3.24.1"
