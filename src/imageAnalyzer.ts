@@ -68,10 +68,12 @@ async function analyzeImages(images: string[], prompt: string): Promise<string> 
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${API_KEY}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Accept': '*/*',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive'
       },
-      body: JSON.stringify(requestData),
-      signal: AbortSignal.timeout(1000000)
+      body: JSON.stringify(requestData)
     });
 
     if (!response.ok) {
